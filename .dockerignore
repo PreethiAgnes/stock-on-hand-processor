@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+data
+docs
+infra
+helm
+ansible
+tests
+samples
+*.zip
+__pycache__

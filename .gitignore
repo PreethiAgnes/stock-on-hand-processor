@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+data/
+uploads/
+.pytest_cache/
+.terraform/
+.docker-config/
+*.tfstate*

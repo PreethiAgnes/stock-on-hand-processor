@@ -1,0 +1,31 @@
+---
+- name: Render and apply CSV Processor release
+  hosts: local
+  gather_facts: false
+  vars:
+    release_name: csv-processor
+    namespace: csv-processor
+    chart_path: "{{ playbook_dir }}/../helm/csv-processor"
+    image_repository: ""
+    image_tag: latest
+    s3_bucket: ""
+    aws_region: us-east-1
+    dynamodb_table: csv-processing-jobs
+    irsa_role_arn: ""
+  tasks:
+    - name: Check required deployment variables
+      ansible.builtin.assert:
+        that: [image_repository | length > 0, s3_bucket | length > 0, irsa_role_arn | length > 0]
+        fail_msg: Set image_repository and s3_bucket as extra vars; do not place credentials in playbooks.
+    - name: Deploy Helm release
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install {{ release_name }} {{ chart_path }}
+          --namespace {{ namespace }} --create-namespace
+          --set image.repository={{ image_repository }}
+          --set image.tag={{ image_tag }}
+          --set s3.bucket={{ s3_bucket }} --set s3.region={{ aws_region }}
+          --set s3.localStorage=false
+          --set metadata.dynamodbTable={{ dynamodb_table }}
+          --set-string serviceAccount.annotations.eks\.amazonaws\.com/role-arn={{ irsa_role_arn }}
+      changed_when: true

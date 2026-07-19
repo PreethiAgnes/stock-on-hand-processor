@@ -1,0 +1,6 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: {{ include "csv-processor.fullname" . }} }
+spec:
+  minAvailable: 1
+  selector: { matchLabels: { app.kubernetes.io/name: {{ include "csv-processor.name" . }} } }

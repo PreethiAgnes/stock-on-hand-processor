@@ -1,5 +1,6 @@
 terraform {
   required_version = ">= 1.6.0"
+  backend "s3" {}
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,6 +10,11 @@ terraform {
 }
 
 variable "bucket_name" { type = string }
+variable "allow_bucket_destroy" {
+  description = "Permit deletion of a non-empty versioned data bucket. Enable only during an approved destroy operation."
+  type        = bool
+  default     = false
+}
 variable "region" {
   type    = string
   default = "us-east-1"
@@ -30,7 +36,10 @@ variable "service_account_subject" {
 
 provider "aws" { region = var.region }
 
-resource "aws_s3_bucket" "uploads" { bucket = var.bucket_name }
+resource "aws_s3_bucket" "uploads" {
+  bucket        = var.bucket_name
+  force_destroy = var.allow_bucket_destroy
+}
 
 resource "aws_s3_bucket_versioning" "uploads" {
   bucket = aws_s3_bucket.uploads.id

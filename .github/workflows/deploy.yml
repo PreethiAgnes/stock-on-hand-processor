@@ -6,7 +6,7 @@ on:
         description: GitHub Environment to deploy
         required: true
         type: choice
-        options: [development, staging, production]
+        options: [dev, staging, production]
       reconcile_cluster:
         description: Reconcile the kOps cluster and instance groups
         required: true

@@ -24,6 +24,26 @@ Author: Preethi Agnes
 
 See [docs/architecture.md](docs/architecture.md) for the architecture diagram.
 
+## Local verification
+
+The published Docker image was deployed to a local Kubernetes cluster using the Helm chart.
+
+### Home page
+
+![Application home page](docs/screenshots/Home_Page.png)
+
+### Processed CSV
+
+![Processed CSV result](docs/screenshots/Processed_CSV.png)
+
+### Processing history
+
+![Processing history](docs/screenshots/Processing_History.png)
+
+### Kubernetes resources
+
+![Kubernetes resources](docs/screenshots/K8s_local_resources.png)
+
 ## Run with Docker
 
 ```bash

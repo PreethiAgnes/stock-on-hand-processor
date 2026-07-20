@@ -28,7 +28,7 @@ jobs:
           cache: pip
 
       - run: pip install -r requirements.txt
-      - run: pytest -q
+      - run: python -m pytest -q
 
       - uses: azure/setup-helm@v4
       - run: helm lint helm/csv-processor

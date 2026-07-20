@@ -1,12 +1,40 @@
 apiVersion: v1
 kind: ConfigMap
-metadata: { name: {{ include "csv-processor.fullname" . }}-nginx }
+metadata:
+  name: {{ include "csv-processor.fullname" . }}-nginx
+  labels:
+    app.kubernetes.io/name: {{ include "csv-processor.name" . }}
 data:
   default.conf: |
     server {
       listen 8080;
+      server_name _;
+
       client_max_body_size 11m;
+
+      client_body_temp_path /tmp/client_temp;
       proxy_temp_path /tmp/proxy_temp;
-      location /static/ { alias /usr/share/nginx/html/static/; }
-      location / { proxy_pass http://127.0.0.1:8000; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; }
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+
+      location /static/ {
+        alias /usr/share/nginx/html/static/;
+        access_log off;
+        expires 1h;
+      }
+
+      location / {
+        proxy_pass http://127.0.0.1:8000;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+      }
     }

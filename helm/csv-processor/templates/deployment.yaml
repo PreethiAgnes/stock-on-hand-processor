@@ -22,17 +22,14 @@ spec:
         - name: application
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports: [{ containerPort: 8000, name: http }]
-          env:
-            - { name: LOCAL_STORAGE, value: {{ .Values.s3.localStorage | quote }} }
-            - { name: S3_BUCKET, value: {{ .Values.s3.bucket | quote }} }
-            - { name: AWS_REGION, value: {{ .Values.s3.region | quote }} }
-            - { name: DYNAMODB_TABLE, value: {{ .Values.metadata.dynamodbTable | quote }} }
-          volumeMounts: [{ name: static-files, mountPath: /shared-static }]
-          resources: {{- toYaml .Values.resources | nindent 12 }}
-          readinessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 3 }
-          livenessProbe: { httpGet: { path: /health/live, port: http }, initialDelaySeconds: 10 }
-          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
         - name: nginx
           image: nginx:1.27-alpine
           command: ["nginx"]

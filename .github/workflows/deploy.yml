@@ -1,0 +1,223 @@
+name: Deploy environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub Environment to deploy
+        required: true
+        type: choice
+        options: [development, staging, production]
+      reconcile_cluster:
+        description: Reconcile the kOps cluster and instance groups
+        required: true
+        default: false
+        type: boolean
+      apply_infrastructure:
+        description: Apply S3, DynamoDB, IAM and IRSA Terraform
+        required: true
+        default: true
+        type: boolean
+      deploy_application:
+        description: Build, publish and deploy the application
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require at least one deployment scope
+        env:
+          CLUSTER: ${{ inputs.reconcile_cluster }}
+          INFRA: ${{ inputs.apply_infrastructure }}
+          APP: ${{ inputs.deploy_application }}
+        run: |
+          set -euo pipefail
+          test "$CLUSTER" = "true" -o "$INFRA" = "true" -o "$APP" = "true" || {
+            echo "Select at least one deployment scope"
+            exit 1
+          }
+
+  deploy:
+    needs: validate-request
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 75
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      KOPS_CLUSTER_NAME: ${{ vars.KOPS_CLUSTER_NAME }}
+      KOPS_STATE_STORE: ${{ vars.KOPS_STATE_STORE }}
+      KOPS_OIDC_BUCKET: ${{ vars.KOPS_OIDC_BUCKET }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+      TF_STATE_KEY: ${{ inputs.environment }}/csv-processor.tfstate
+      TF_VAR_bucket_name: ${{ vars.CSV_BUCKET_NAME }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_oidc_provider_arn: ${{ vars.OIDC_PROVIDER_ARN }}
+      TF_VAR_oidc_provider_url: ${{ vars.OIDC_PROVIDER_URL }}
+      DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure temporary AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install kOps
+        if: inputs.reconcile_cluster || inputs.deploy_application
+        env:
+          KOPS_VERSION: v1.30.0
+        run: |
+          set -euo pipefail
+          curl -fsSLo kops "https://github.com/kubernetes/kops/releases/download/${KOPS_VERSION}/kops-linux-amd64"
+          curl -fsSLo kops.sha256 "https://github.com/kubernetes/kops/releases/download/${KOPS_VERSION}/kops-linux-amd64.sha256"
+          echo "$(awk '{print $1}' kops.sha256)  kops" | sha256sum --check
+          chmod +x kops
+          sudo mv kops /usr/local/bin/kops
+
+      - name: Render account-specific kOps configuration
+        if: inputs.reconcile_cluster
+        run: |
+          set -euo pipefail
+          STATE_BUCKET="${KOPS_STATE_STORE#s3://}"
+          sed -e "s/csv.example.com/$KOPS_CLUSTER_NAME/g" \
+              -e "s/REPLACE_KOPS_STATE_BUCKET/$STATE_BUCKET/g" \
+              -e "s/REPLACE_OIDC_BUCKET/$KOPS_OIDC_BUCKET/g" \
+              infra/kops/cluster.yaml > /tmp/cluster.yaml
+          sed "s/csv.example.com/$KOPS_CLUSTER_NAME/g" infra/kops/instancegroups.yaml > /tmp/instancegroups.yaml
+
+      - name: Reconcile kOps cluster and instance groups
+        if: inputs.reconcile_cluster
+        run: |
+          set -euo pipefail
+          kops replace -f /tmp/cluster.yaml --state "$KOPS_STATE_STORE"
+          kops replace -f /tmp/instancegroups.yaml --state "$KOPS_STATE_STORE"
+          kops update cluster "$KOPS_CLUSTER_NAME" --state "$KOPS_STATE_STORE" --yes --admin
+          kops validate cluster "$KOPS_CLUSTER_NAME" --state "$KOPS_STATE_STORE" --wait 15m
+
+      - name: Set up Terraform
+        if: inputs.apply_infrastructure
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Initialize remote Terraform state
+        if: inputs.apply_infrastructure
+        run: |
+          terraform -chdir=infra/s3 init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: Plan infrastructure changes
+        if: inputs.apply_infrastructure
+        run: terraform -chdir=infra/s3 plan -out=deploy.tfplan
+
+      - name: Apply reviewed infrastructure plan
+        if: inputs.apply_infrastructure
+        run: terraform -chdir=infra/s3 apply -auto-approve deploy.tfplan
+
+      - name: Resolve IRSA role from Terraform
+        if: inputs.apply_infrastructure
+        id: terraform-output
+        run: echo "irsa_role_arn=$(terraform -chdir=infra/s3 output -raw irsa_role_arn)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        if: inputs.deploy_application
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set immutable image coordinates
+        if: inputs.deploy_application
+        id: image
+        env:
+          REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          test -n "$REPOSITORY" || { echo "Set DOCKERHUB_REPOSITORY, for example preethiagnes/stock-on-hand-processor"; exit 1; }
+          echo "repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish application image
+        if: inputs.deploy_application
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.repository }}:${{ github.sha }}
+            ${{ steps.image.outputs.repository }}:${{ inputs.environment }}-latest
+
+      - name: Install Helm
+        if: inputs.deploy_application
+        uses: azure/setup-helm@v4
+
+      - name: Install kubectl
+        if: inputs.deploy_application
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Export cluster credentials
+        if: inputs.deploy_application
+        run: kops export kubecfg "$KOPS_CLUSTER_NAME" --state "$KOPS_STATE_STORE" --admin
+
+      - name: Resolve application deployment values
+        if: inputs.deploy_application
+        id: app-values
+        env:
+          APPLIED_IRSA_ROLE: ${{ steps.terraform-output.outputs.irsa_role_arn }}
+          CONFIGURED_IRSA_ROLE: ${{ vars.IRSA_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          ROLE="${APPLIED_IRSA_ROLE:-$CONFIGURED_IRSA_ROLE}"
+          test -n "$ROLE" || { echo "IRSA role is missing; apply infrastructure or set IRSA_ROLE_ARN"; exit 1; }
+          echo "irsa_role_arn=$ROLE" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy application with atomic rollback
+        if: inputs.deploy_application
+        run: |
+          helm upgrade --install csv-processor helm/csv-processor \
+            --namespace csv-processor --create-namespace \
+            --set image.repository="${{ steps.image.outputs.repository }}" \
+            --set image.tag="${{ github.sha }}" \
+            --set s3.bucket="$TF_VAR_bucket_name" \
+            --set s3.region="$AWS_REGION" \
+            --set s3.localStorage=false \
+            --set metadata.dynamodbTable="$DYNAMODB_TABLE" \
+            --set-string serviceAccount.annotations.eks\.amazonaws\.com/role-arn="${{ steps.app-values.outputs.irsa_role_arn }}" \
+            --atomic --wait --timeout 10m
+
+      - name: Verify rollout
+        if: inputs.deploy_application
+        run: |
+          kubectl rollout status deployment/csv-processor-csv-processor --namespace csv-processor --timeout=5m
+          kubectl get pods,service,hpa,pdb --namespace csv-processor
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          {
+            echo "## Deployment"
+            echo "- Environment: ${{ inputs.environment }}"
+            echo "- Cluster reconciliation: ${{ inputs.reconcile_cluster }}"
+            echo "- Infrastructure apply: ${{ inputs.apply_infrastructure }}"
+            echo "- Application deploy: ${{ inputs.deploy_application }}"
+            echo "- Image tag: ${{ github.sha }}"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

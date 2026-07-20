@@ -1,0 +1,163 @@
+name: Destroy environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub Environment to destroy
+        required: true
+        type: choice
+        options: [development, staging, production]
+      destroy_application:
+        description: Uninstall the Helm release
+        required: true
+        default: false
+        type: boolean
+      destroy_cluster:
+        description: Delete the kOps cluster
+        required: true
+        default: false
+        type: boolean
+      destroy_data_infra:
+        description: Destroy S3, DynamoDB and workload IAM (deletes stored CSVs)
+        required: true
+        default: false
+        type: boolean
+      confirmation:
+        description: Type DESTROY-development, DESTROY-staging, or DESTROY-production
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: destroy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-request:
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.guard.outputs.approved }}
+    steps:
+      - name: Validate explicit confirmation and scope
+        id: guard
+        env:
+          EXPECTED: DESTROY-${{ inputs.environment }}
+          PROVIDED: ${{ inputs.confirmation }}
+          DESTROY_APP: ${{ inputs.destroy_application }}
+          DESTROY_CLUSTER: ${{ inputs.destroy_cluster }}
+          DESTROY_INFRA: ${{ inputs.destroy_data_infra }}
+        run: |
+          set -euo pipefail
+          test "$PROVIDED" = "$EXPECTED" || { echo "Confirmation must exactly match $EXPECTED"; exit 1; }
+          test "$DESTROY_APP" = "true" -o "$DESTROY_CLUSTER" = "true" -o "$DESTROY_INFRA" = "true" || { echo "Select at least one destroy scope"; exit 1; }
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+
+  destroy:
+    needs: validate-request
+    if: needs.validate-request.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 60
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      KOPS_CLUSTER_NAME: ${{ vars.KOPS_CLUSTER_NAME }}
+      KOPS_STATE_STORE: ${{ vars.KOPS_STATE_STORE }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+      TF_STATE_KEY: ${{ inputs.environment }}/csv-processor.tfstate
+      TF_VAR_bucket_name: ${{ vars.CSV_BUCKET_NAME }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_oidc_provider_arn: ${{ vars.OIDC_PROVIDER_ARN }}
+      TF_VAR_oidc_provider_url: ${{ vars.OIDC_PROVIDER_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure temporary AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install Helm
+        if: inputs.destroy_application || inputs.destroy_cluster
+        uses: azure/setup-helm@v4
+
+      - name: Install kubectl
+        if: inputs.destroy_application
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Install kOps
+        if: inputs.destroy_application || inputs.destroy_cluster
+        env:
+          KOPS_VERSION: v1.30.0
+        run: |
+          set -euo pipefail
+          curl -fsSLo kops "https://github.com/kubernetes/kops/releases/download/${KOPS_VERSION}/kops-linux-amd64"
+          curl -fsSLo kops.sha256 "https://github.com/kubernetes/kops/releases/download/${KOPS_VERSION}/kops-linux-amd64.sha256"
+          echo "$(awk '{print $1}' kops.sha256)  kops" | sha256sum --check
+          chmod +x kops
+          sudo mv kops /usr/local/bin/kops
+
+      - name: Export cluster credentials
+        if: inputs.destroy_application
+        run: kops export kubecfg "$KOPS_CLUSTER_NAME" --state "$KOPS_STATE_STORE" --admin
+
+      - name: Uninstall application release
+        if: inputs.destroy_application
+        run: |
+          set -euo pipefail
+          if helm status csv-processor --namespace csv-processor >/dev/null 2>&1; then
+            helm uninstall csv-processor --namespace csv-processor --wait --timeout 5m
+          else
+            echo "Helm release is already absent"
+          fi
+
+      - name: Delete kOps cluster
+        if: inputs.destroy_cluster
+        run: kops delete cluster --name "$KOPS_CLUSTER_NAME" --state "$KOPS_STATE_STORE" --yes
+
+      - name: Set up Terraform
+        if: inputs.destroy_data_infra
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Initialize remote Terraform state
+        if: inputs.destroy_data_infra
+        run: |
+          terraform -chdir=infra/s3 init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="encrypt=true"
+
+      - name: Create reviewed destroy plan
+        if: inputs.destroy_data_infra
+        run: terraform -chdir=infra/s3 plan -destroy -out=destroy.tfplan -var='allow_bucket_destroy=true'
+
+      - name: Destroy application data infrastructure
+        if: inputs.destroy_data_infra
+        run: terraform -chdir=infra/s3 apply -auto-approve destroy.tfplan
+
+      - name: Write destruction summary
+        if: always()
+        env:
+          DESTROY_APP: ${{ inputs.destroy_application }}
+          DESTROY_CLUSTER: ${{ inputs.destroy_cluster }}
+          DESTROY_INFRA: ${{ inputs.destroy_data_infra }}
+        run: |
+          {
+            echo "## Destroy request"
+            echo "- Environment: ${{ inputs.environment }}"
+            echo "- Application selected: $DESTROY_APP"
+            echo "- Cluster selected: $DESTROY_CLUSTER"
+            echo "- Data infrastructure selected: $DESTROY_INFRA"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
